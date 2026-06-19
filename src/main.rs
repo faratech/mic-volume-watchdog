@@ -12,11 +12,8 @@ use windows::core::GUID;
 use windows_core::implement;
 
 use windows::{
-    Win32::Devices::FunctionDiscovery::*,
-    Win32::Media::Audio::Endpoints::*,
-    Win32::Media::Audio::*,
-    Win32::System::Com::StructuredStorage::*,
-    Win32::System::Com::*,
+    Win32::Devices::FunctionDiscovery::*, Win32::Media::Audio::Endpoints::*,
+    Win32::Media::Audio::*, Win32::System::Com::StructuredStorage::*, Win32::System::Com::*,
     Win32::UI::Shell::PropertiesSystem::*,
 };
 
@@ -24,31 +21,71 @@ const NOTIFY_COOLDOWN_SECS: u64 = 30;
 const VOLUME_RESTORE_THRESHOLD: f32 = 1.0;
 const RETRY_DELAY_MIN_MS: u64 = 500;
 const RETRY_DELAY_MAX_MS: u64 = 5_000;
-const EXTERNAL_DEBOUNCE_WINDOW_MS: u64 = 100;
-const EXTERNAL_DEBOUNCE_SAMPLES: u32 = 3;
-const EXTERNAL_DEBOUNCE_STEP_MS: u64 = 45;
-const PERIODIC_RESTORE_CONFIRMATIONS: u32 = 2;
-const RESTORE_RATE_LIMIT_MS: u64 = 250;
-const RESTORE_RATE_LIMIT_MAX_MS: u64 = 2_000;
+const EXTERNAL_DEBOUNCE_WINDOW_MS: u64 = 40;
+const EXTERNAL_DEBOUNCE_SAMPLES: u32 = 1;
+const EXTERNAL_DEBOUNCE_STEP_MS: u64 = 0;
+const PERIODIC_CHECK_INTERVAL_MS: u64 = 250;
+const PAUSED_SLEEP_MS: u64 = 250;
+const RESTORE_RATE_LIMIT_MS: u64 = 75;
+const RESTORE_RATE_LIMIT_MAX_MS: u64 = 250;
+const UNSTABLE_EXTERNAL_RETRY_MS: u64 = 10;
 const MIC_FIXER_CONTEXT: GUID = GUID::from_u128(0x5e4f84ce_2b8f_4a74_b7f8_1b7f9d4e1c6a);
 
 #[implement(IAudioEndpointVolumeCallback)]
 struct VolumeCallback {
-    tx: mpsc::Sender<()>,
+    tx: mpsc::SyncSender<()>,
     allowed_context: GUID,
 }
 
 impl IAudioEndpointVolumeCallback_Impl for VolumeCallback_Impl {
     fn OnNotify(&self, pnotify: *mut AUDIO_VOLUME_NOTIFICATION_DATA) -> windows_core::Result<()> {
-        let allow = unsafe {
-            !pnotify.is_null() && (*pnotify).guidEventContext == self.allowed_context
-        };
+        let allow =
+            unsafe { !pnotify.is_null() && (*pnotify).guidEventContext == self.allowed_context };
 
         if !allow {
-            let _ = self.tx.send(());
+            let _ = self.tx.try_send(());
         }
 
         Ok(())
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ActionReason {
+    Starting,
+    AcquiredDefaultMic,
+    CallbackRegistrationFailed,
+    DefaultMicChanged,
+    DefaultMicCheckFailed,
+    ExternalChange,
+    ExternalStateRetry,
+    NoRestoreNeeded,
+    PeriodicCheck,
+    PeriodicCheckStable,
+    Reconnect,
+    RestoreRateLimited,
+    WriteFailed,
+    WriteVerified,
+}
+
+impl ActionReason {
+    fn label(self) -> &'static str {
+        match self {
+            ActionReason::Starting => "starting",
+            ActionReason::AcquiredDefaultMic => "acquired default mic",
+            ActionReason::CallbackRegistrationFailed => "callback registration failed",
+            ActionReason::DefaultMicChanged => "default mic changed",
+            ActionReason::DefaultMicCheckFailed => "default mic check failed",
+            ActionReason::ExternalChange => "external-change",
+            ActionReason::ExternalStateRetry => "external-state retry",
+            ActionReason::NoRestoreNeeded => "no restore needed",
+            ActionReason::PeriodicCheck => "periodic-check",
+            ActionReason::PeriodicCheckStable => "periodic check stable",
+            ActionReason::Reconnect => "reconnect",
+            ActionReason::RestoreRateLimited => "restore rate limited",
+            ActionReason::WriteFailed => "write-failed",
+            ActionReason::WriteVerified => "write-verified",
+        }
     }
 }
 
@@ -68,12 +105,24 @@ fn format_duration(total_secs: u64) -> String {
     let secs = rem % 60;
 
     let mut parts = Vec::new();
-    if years > 0 { parts.push(format!("{years}y")); }
-    if weeks > 0 { parts.push(format!("{weeks}w")); }
-    if days > 0 { parts.push(format!("{days}d")); }
-    if hours > 0 { parts.push(format!("{hours}h")); }
-    if mins > 0 { parts.push(format!("{mins}m")); }
-    if secs > 0 { parts.push(format!("{secs}s")); }
+    if years > 0 {
+        parts.push(format!("{years}y"));
+    }
+    if weeks > 0 {
+        parts.push(format!("{weeks}w"));
+    }
+    if days > 0 {
+        parts.push(format!("{days}d"));
+    }
+    if hours > 0 {
+        parts.push(format!("{hours}h"));
+    }
+    if mins > 0 {
+        parts.push(format!("{mins}m"));
+    }
+    if secs > 0 {
+        parts.push(format!("{secs}s"));
+    }
     parts.join(" ")
 }
 
@@ -105,8 +154,9 @@ struct Status {
     post_write_verify_failures: u32,
     restore_attempts: u32,
     restore_misses: u32,
+    restore_noop_cycles: u32,
     error: Option<String>,
-    last_action_reason: Option<String>,
+    last_action_reason: ActionReason,
 }
 
 struct MicHandle {
@@ -150,7 +200,13 @@ fn create_icon(active: bool) -> Icon {
         for x in 11..=20 {
             // Round the top corners
             let draw = if y <= 5 {
-                let dx = if x < 13 { 13.0 - x as f32 } else if x > 18 { x as f32 - 18.0 } else { 0.0 };
+                let dx = if x < 13 {
+                    13.0 - x as f32
+                } else if x > 18 {
+                    x as f32 - 18.0
+                } else {
+                    0.0
+                };
                 let dy = 5.0 - y as f32;
                 dx * dx + dy * dy <= 6.5
             } else {
@@ -239,17 +295,16 @@ fn ensure_single_instance() -> *mut std::ffi::c_void {
 }
 
 /// Enable Windows Efficiency Mode (EcoQoS) for the current process.
-/// Sets idle priority and enables power throttling to minimize battery impact.
+/// The monitor is event-driven, so this keeps laptop impact low without
+/// relying on a high-frequency idle loop for responsiveness.
 fn enable_efficiency_mode() {
     use windows_sys::Win32::System::Threading::*;
 
     unsafe {
         let handle = GetCurrentProcess();
 
-        // Set to idle priority class (lowest scheduling priority)
         let _ = SetPriorityClass(handle, IDLE_PRIORITY_CLASS);
 
-        // Enable EcoQoS power throttling
         let mut throttle_state = PROCESS_POWER_THROTTLING_STATE {
             Version: 1,
             ControlMask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED
@@ -261,7 +316,7 @@ fn enable_efficiency_mode() {
         let _ = SetProcessInformation(
             handle,
             ProcessPowerThrottling,
-            &mut throttle_state as *mut _ as *mut _,
+            &raw mut throttle_state as *mut _,
             std::mem::size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
         );
     }
@@ -277,10 +332,9 @@ fn is_in_startup() -> bool {
     use windows_sys::Win32::System::Registry::*;
 
     unsafe {
-        let subkey: Vec<u16> =
-            "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run\0"
-                .encode_utf16()
-                .collect();
+        let subkey: Vec<u16> = "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run\0"
+            .encode_utf16()
+            .collect();
         let value_name: Vec<u16> = "MicVolumeFix\0".encode_utf16().collect();
         let mut hkey = std::ptr::null_mut();
 
@@ -304,13 +358,13 @@ fn is_in_startup() -> bool {
 }
 
 fn set_startup(enable: bool) -> Result<(), String> {
+    use windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND;
     use windows_sys::Win32::System::Registry::*;
 
     unsafe {
-        let subkey: Vec<u16> =
-            "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run\0"
-                .encode_utf16()
-                .collect();
+        let subkey: Vec<u16> = "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run\0"
+            .encode_utf16()
+            .collect();
         let value_name: Vec<u16> = "MicVolumeFix\0".encode_utf16().collect();
         let mut hkey = std::ptr::null_mut();
 
@@ -326,7 +380,8 @@ fn set_startup(enable: bool) -> Result<(), String> {
         }
 
         let status = if enable {
-            let exe = get_exe_path().ok_or_else(|| "Failed to resolve executable path".to_string())?;
+            let exe =
+                get_exe_path().ok_or_else(|| "Failed to resolve executable path".to_string())?;
             let value: Vec<u16> = format!("\"{exe}\"\0").encode_utf16().collect();
             RegSetValueExW(
                 hkey,
@@ -337,7 +392,12 @@ fn set_startup(enable: bool) -> Result<(), String> {
                 (value.len() * 2) as u32,
             )
         } else {
-            RegDeleteValueW(hkey, value_name.as_ptr())
+            let status = RegDeleteValueW(hkey, value_name.as_ptr());
+            if status == ERROR_FILE_NOT_FOUND {
+                0
+            } else {
+                status
+            }
         };
 
         RegCloseKey(hkey);
@@ -355,7 +415,9 @@ fn set_startup(enable: bool) -> Result<(), String> {
 /// Get the device ID of the current default capture device.
 fn get_default_mic_id(enumerator: &IMMDeviceEnumerator) -> Option<String> {
     unsafe {
-        let device: IMMDevice = enumerator.GetDefaultAudioEndpoint(eCapture, eConsole).ok()?;
+        let device: IMMDevice = enumerator
+            .GetDefaultAudioEndpoint(eCapture, eConsole)
+            .ok()?;
         device.GetId().ok()?.to_string().ok()
     }
 }
@@ -404,7 +466,7 @@ fn read_stable_mic_state(
 
 fn register_mic_callback(
     mic: &mut MicHandle,
-    callback_tx: &mpsc::Sender<()>,
+    callback_tx: &mpsc::SyncSender<()>,
     callback_context: GUID,
     status: &Arc<Mutex<Status>>,
 ) -> Option<IAudioEndpointVolumeCallback> {
@@ -414,19 +476,19 @@ fn register_mic_callback(
     }
     .into();
 
-    if mic.volume.RegisterControlChangeNotify(&callback).is_ok() {
+    if unsafe { mic.volume.RegisterControlChangeNotify(&callback) }.is_ok() {
         Some(callback)
     } else {
         let mut s = status.lock().unwrap();
         s.callback_registration_failures += 1;
-        s.last_action_reason = Some("callback registration failed".into());
+        s.last_action_reason = ActionReason::CallbackRegistrationFailed;
         None
     }
 }
 
 fn acquire_mic_with_callback(
     enumerator: &IMMDeviceEnumerator,
-    callback_tx: &mpsc::Sender<()>,
+    callback_tx: &mpsc::SyncSender<()>,
     callback_context: GUID,
     status: &Arc<Mutex<Status>>,
 ) -> Option<MicHandle> {
@@ -446,7 +508,7 @@ fn ensure_default_mic_for_write(
     enumerator: &IMMDeviceEnumerator,
     expected_mic_id: &str,
     force_refresh: bool,
-    callback_tx: &mpsc::Sender<()>,
+    callback_tx: &mpsc::SyncSender<()>,
     callback_context: GUID,
     status: &Arc<Mutex<Status>>,
     mic: &mut Option<MicHandle>,
@@ -458,7 +520,7 @@ fn ensure_default_mic_for_write(
                 let mut s = status.lock().unwrap();
                 s.reconnects += 1;
                 s.error = Some("Failed to verify default microphone".into());
-                s.last_action_reason = Some("reconnect".into());
+                s.last_action_reason = ActionReason::Reconnect;
             }
             detach_mic(mic);
             return None;
@@ -470,7 +532,7 @@ fn ensure_default_mic_for_write(
             let mut s = status.lock().unwrap();
             s.reconnects += 1;
             s.error = Some("Default microphone changed, reconnecting...".into());
-            s.last_action_reason = Some("reconnect".into());
+            s.last_action_reason = ActionReason::Reconnect;
         }
         detach_mic(mic);
         return None;
@@ -485,18 +547,19 @@ fn ensure_default_mic_for_write(
             let mut s = status.lock().unwrap();
             s.reconnects += 1;
             s.error = Some("Microphone handle missing, reconnecting...".into());
-            s.last_action_reason = Some("reconnect".into());
+            s.last_action_reason = ActionReason::Reconnect;
         }
         return None;
     }
 
-    let refreshed = match acquire_mic_with_callback(enumerator, callback_tx, callback_context, status) {
-        Some(refreshed) => refreshed,
-        None => {
-            detach_mic(mic);
-            return None;
-        }
-    };
+    let refreshed =
+        match acquire_mic_with_callback(enumerator, callback_tx, callback_context, status) {
+            Some(refreshed) => refreshed,
+            None => {
+                detach_mic(mic);
+                return None;
+            }
+        };
 
     let volume = refreshed.volume.clone();
     if refreshed.id != expected_mic_id {
@@ -504,7 +567,7 @@ fn ensure_default_mic_for_write(
             let mut s = status.lock().unwrap();
             s.reconnects += 1;
             s.error = Some("Default microphone changed, reconnecting...".into());
-            s.last_action_reason = Some("reconnect".into());
+            s.last_action_reason = ActionReason::Reconnect;
         }
         detach_mic(mic);
         return None;
@@ -513,20 +576,21 @@ fn ensure_default_mic_for_write(
     {
         let mut s = status.lock().unwrap();
         s.reconnects += 1;
-        s.last_action_reason = Some("reconnect".into());
+        s.last_action_reason = ActionReason::Reconnect;
     }
 
+    detach_mic(mic);
     *mic = Some(refreshed);
     Some(volume)
 }
 
 /// Try to get the default capture device and its volume control.
 /// Returns a tracked capture-device handle or None if no mic.
-fn acquire_mic(
-    enumerator: &IMMDeviceEnumerator,
-) -> Option<MicHandle> {
+fn acquire_mic(enumerator: &IMMDeviceEnumerator) -> Option<MicHandle> {
     unsafe {
-        let device: IMMDevice = enumerator.GetDefaultAudioEndpoint(eCapture, eConsole).ok()?;
+        let device: IMMDevice = enumerator
+            .GetDefaultAudioEndpoint(eCapture, eConsole)
+            .ok()?;
 
         let device_id = device.GetId().ok()?.to_string().ok()?;
 
@@ -547,15 +611,12 @@ fn acquire_mic(
     }
 }
 
-fn detach_mic(
-    mic: &mut Option<MicHandle>,
-) {
-    if let Some(mut inner) = mic.take() {
-        if inner.callback_registered {
-            if let Some(callback) = inner.callback.take() {
-                let _ = unsafe { inner.volume.UnregisterControlChangeNotify(&callback) };
-            }
-        }
+fn detach_mic(mic: &mut Option<MicHandle>) {
+    if let Some(mut inner) = mic.take()
+        && inner.callback_registered
+        && let Some(callback) = inner.callback.take()
+    {
+        let _ = unsafe { inner.volume.UnregisterControlChangeNotify(&callback) };
     }
 }
 
@@ -577,12 +638,13 @@ fn main() {
         post_write_verify_failures: 0,
         restore_attempts: 0,
         restore_misses: 0,
+        restore_noop_cycles: 0,
         error: None,
-        last_action_reason: Some("Starting".into()),
+        last_action_reason: ActionReason::Starting,
     }));
 
-    let (notify_tx, notify_rx) = mpsc::channel::<String>();
-    let (callback_tx, callback_rx) = mpsc::channel::<()>();
+    let (notify_tx, notify_rx) = mpsc::sync_channel::<String>(1);
+    let (callback_tx, callback_rx) = mpsc::sync_channel::<()>(1);
     let running = Arc::new(AtomicBool::new(true));
 
     let status_clone = status.clone();
@@ -600,29 +662,21 @@ fn main() {
             let mut mic: Option<MicHandle> = None;
             let mut last_notify = Instant::now() - Duration::from_secs(NOTIFY_COOLDOWN_SECS);
             let mut pending_external_change: Option<Instant> = None;
-            let mut last_restore_action = Instant::now() - Duration::from_millis(RESTORE_RATE_LIMIT_MS);
+            let mut last_restore_action =
+                Instant::now() - Duration::from_millis(RESTORE_RATE_LIMIT_MS);
             let mut restore_rate_limit_ms = RESTORE_RATE_LIMIT_MS;
-            let mut last_periodic_check = Instant::now() - Duration::from_secs(1);
-            let mut periodic_miss_streak = 0u32;
-            let mut external_change_handling;
+            let mut last_periodic_check =
+                Instant::now() - Duration::from_millis(PERIODIC_CHECK_INTERVAL_MS);
+            let mut last_idle_status_update = Instant::now() - Duration::from_secs(1);
 
             loop {
                 if !running_clone.load(Ordering::Acquire) {
                     break;
                 }
 
-                let mut callback_hit = false;
-                while let Ok(()) = callback_rx.try_recv() {
-                    callback_hit = true;
-                }
-
-                if callback_hit {
-                    pending_external_change = Some(Instant::now());
-                }
-
                 // If paused, just sleep
                 if paused_clone.load(Ordering::Relaxed) {
-                    thread::sleep(Duration::from_secs(1));
+                    let _ = callback_rx.recv_timeout(Duration::from_millis(PAUSED_SLEEP_MS));
                     continue;
                 }
 
@@ -669,7 +723,6 @@ fn main() {
                         callback_context,
                         &status_clone,
                     ) {
-
                         None => {
                             thread::sleep(Duration::from_millis(notify_delay_ms));
                             notify_delay_ms = next_retry_delay(notify_delay_ms);
@@ -678,7 +731,7 @@ fn main() {
 
                         Some(new_mic) => {
                             let mut s = status_clone.lock().unwrap();
-                            s.last_action_reason = Some("acquired default mic".into());
+                            s.last_action_reason = ActionReason::AcquiredDefaultMic;
                             mic = Some(new_mic);
                             notify_delay_ms = RETRY_DELAY_MIN_MS;
                             enumerator_delay_ms = RETRY_DELAY_MIN_MS;
@@ -687,14 +740,45 @@ fn main() {
                 }
 
                 let now = Instant::now();
-                let due_periodic = now.duration_since(last_periodic_check) >= Duration::from_secs(1);
-                external_change_handling = if let Some(change_time) = pending_external_change {
-                    now.duration_since(change_time) >= Duration::from_millis(EXTERNAL_DEBOUNCE_WINDOW_MS)
+                let next_wake = if let Some(change_time) = pending_external_change {
+                    change_time + Duration::from_millis(EXTERNAL_DEBOUNCE_WINDOW_MS)
+                } else {
+                    last_periodic_check + Duration::from_millis(PERIODIC_CHECK_INTERVAL_MS)
+                };
+                let wait_for = next_wake.saturating_duration_since(now);
+
+                if !wait_for.is_zero() {
+                    match callback_rx.recv_timeout(wait_for) {
+                        Ok(()) => {
+                            pending_external_change = Some(Instant::now());
+                            while callback_rx.try_recv().is_ok() {}
+                            continue;
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
+                } else {
+                    let mut callback_hit = false;
+                    while callback_rx.try_recv().is_ok() {
+                        callback_hit = true;
+                    }
+                    if callback_hit {
+                        pending_external_change = Some(Instant::now());
+                        continue;
+                    }
+                }
+
+                let now = Instant::now();
+                let due_periodic = now.duration_since(last_periodic_check)
+                    >= Duration::from_millis(PERIODIC_CHECK_INTERVAL_MS);
+                let external_change_handling = if let Some(change_time) = pending_external_change {
+                    now.duration_since(change_time)
+                        >= Duration::from_millis(EXTERNAL_DEBOUNCE_WINDOW_MS)
                 } else {
                     false
                 };
+
                 if !due_periodic && !external_change_handling {
-                    thread::sleep(Duration::from_millis(40));
                     continue;
                 }
 
@@ -706,13 +790,15 @@ fn main() {
                 match get_default_mic_id(enumerator) {
                     Some(current_default_id) if current_default_id == current_mic_id => {
                         // Still default: proceed.
-                        last_periodic_check = now;
+                        if due_periodic || external_change_handling {
+                            last_periodic_check = now;
+                        }
                     }
                     Some(_) => {
                         {
                             let mut s = status_clone.lock().unwrap();
                             s.error = Some("Default microphone changed, reconnecting...".into());
-                            s.last_action_reason = Some("Default mic changed".into());
+                            s.last_action_reason = ActionReason::DefaultMicChanged;
                             s.reconnects += 1;
                         }
                         detach_mic(&mut mic);
@@ -726,7 +812,7 @@ fn main() {
                         {
                             let mut s = status_clone.lock().unwrap();
                             s.error = Some("Failed to verify default microphone".into());
-                            s.last_action_reason = Some("Default mic check failed".into());
+                            s.last_action_reason = ActionReason::DefaultMicCheckFailed;
                             s.reconnects += 1;
                         }
                         detach_mic(&mut mic);
@@ -744,41 +830,54 @@ fn main() {
                     1
                 };
 
-                let mut did_unmute = false;
-                let mut did_fix_volume = false;
-                let mut old_pct = 0u32;
                 let state = read_stable_mic_state(&volume, sample_count, EXTERNAL_DEBOUNCE_STEP_MS);
 
-                if let Some(reading) = state {
-                    did_unmute = reading.muted;
-                    did_fix_volume = volume_needs_fix(reading.normalized_level);
-                    old_pct = reading.percent;
-                } else {
+                let Some(reading) = state else {
+                    if external_change_handling {
+                        {
+                            let mut s = status_clone.lock().unwrap();
+                            s.last_action_reason = ActionReason::ExternalStateRetry;
+                        }
+                        thread::sleep(Duration::from_millis(UNSTABLE_EXTERNAL_RETRY_MS));
+                        continue;
+                    }
                     detach_mic(&mut mic);
                     {
                         let mut s = status_clone.lock().unwrap();
                         s.reconnects += 1;
                         s.error = Some("Microphone state unstable, reconnecting...".into());
-                        s.last_action_reason = Some("reconnect".into());
+                        s.last_action_reason = ActionReason::Reconnect;
                     }
                     restore_rate_limit_ms = RESTORE_RATE_LIMIT_MS;
                     thread::sleep(Duration::from_millis(notify_delay_ms));
                     notify_delay_ms = next_retry_delay(notify_delay_ms);
                     pending_external_change = None;
                     continue;
+                };
+                let did_unmute = reading.muted;
+                let did_fix_volume = volume_needs_fix(reading.normalized_level);
+                let old_pct = reading.percent;
+
+                if !external_change_handling && (did_unmute || did_fix_volume) {
+                    pending_external_change = Some(now);
+                    notify_delay_ms = RETRY_DELAY_MIN_MS;
+                    restore_rate_limit_ms = RESTORE_RATE_LIMIT_MS;
+                    continue;
                 }
 
                 if !did_unmute && !did_fix_volume {
-                    periodic_miss_streak = 0;
+                    if external_change_handling
+                        || now.duration_since(last_idle_status_update) >= Duration::from_secs(1)
                     {
                         let mut s = status_clone.lock().unwrap();
-                        s.restore_misses += 1;
+                        s.restore_noop_cycles += 1;
                         s.error = None;
                         s.last_action_reason = if is_periodic_check {
-                            Some("Periodic check stable".into())
+                            ActionReason::PeriodicCheckStable
                         } else {
-                            Some("No restore needed".into())
+                            ActionReason::NoRestoreNeeded
                         };
+                        last_idle_status_update = now;
                     }
                     notify_delay_ms = RETRY_DELAY_MIN_MS;
                     restore_rate_limit_ms = RESTORE_RATE_LIMIT_MS;
@@ -786,30 +885,6 @@ fn main() {
                     last_periodic_check = now;
                     continue;
                 }
-
-                if is_periodic_check {
-                    periodic_miss_streak = periodic_miss_streak.saturating_add(1);
-                } else {
-                    periodic_miss_streak = 0;
-                }
-
-                if is_periodic_check && periodic_miss_streak < PERIODIC_RESTORE_CONFIRMATIONS {
-                    {
-                        let mut s = status_clone.lock().unwrap();
-                        s.restore_misses += 1;
-                        s.error = None;
-                        s.last_action_reason = Some(format!(
-                            "Periodic drift confirmed ({}/{})",
-                            periodic_miss_streak, PERIODIC_RESTORE_CONFIRMATIONS
-                        ));
-                    }
-                    pending_external_change = None;
-                    last_periodic_check = now;
-                    thread::sleep(Duration::from_millis(120));
-                    continue;
-                }
-
-                periodic_miss_streak = 0;
 
                 if external_change_handling
                     && now.duration_since(last_restore_action)
@@ -821,10 +896,16 @@ fn main() {
                     restore_rate_limit_ms = restore_rate_limit_ms.min(RESTORE_RATE_LIMIT_MAX_MS);
                     {
                         let mut s = status_clone.lock().unwrap();
-                        s.last_action_reason =
-                            Some(format!("Restore rate limited ({wait_ms}ms cooldown, burst cap {restore_rate_limit_ms}ms)").into());
+                        s.last_action_reason = ActionReason::RestoreRateLimited;
                     }
-                    thread::sleep(Duration::from_millis(wait_ms.min(restore_rate_limit_ms)));
+                    match callback_rx.recv_timeout(Duration::from_millis(wait_ms)) {
+                        Ok(()) => {
+                            pending_external_change = Some(Instant::now());
+                            while callback_rx.try_recv().is_ok() {}
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
                     continue;
                 }
 
@@ -839,19 +920,24 @@ fn main() {
                 ) {
                     Some(volume) => volume,
                     None => {
-                    restore_rate_limit_ms = RESTORE_RATE_LIMIT_MS;
-                    notify_delay_ms = next_retry_delay(notify_delay_ms);
-                    continue;
+                        if external_change_handling {
+                            pending_external_change = Some(now);
+                            thread::sleep(Duration::from_millis(UNSTABLE_EXTERNAL_RETRY_MS));
+                            continue;
+                        }
+                        restore_rate_limit_ms = RESTORE_RATE_LIMIT_MS;
+                        notify_delay_ms = next_retry_delay(notify_delay_ms);
+                        continue;
                     }
-                }
+                };
 
                 {
                     let mut s = status_clone.lock().unwrap();
                     s.restore_attempts += 1;
                     s.last_action_reason = if external_change_handling {
-                        Some("external-change".into())
+                        ActionReason::ExternalChange
                     } else {
-                        Some("periodic-check".into())
+                        ActionReason::PeriodicCheck
                     };
                 }
                 last_restore_action = Instant::now();
@@ -861,24 +947,24 @@ fn main() {
                 while write_attempts < 2 {
                     let mut recovery_error = None;
 
-                    if did_unmute {
-                        if effective_volume.SetMute(false, &callback_context).is_err() {
-                            recovery_error = Some("Failed to unmute microphone");
-                        }
+                    if did_unmute && effective_volume.SetMute(false, &callback_context).is_err() {
+                        recovery_error = Some("Failed to unmute microphone");
                     }
 
-                    if did_fix_volume {
-                        if effective_volume
+                    if did_fix_volume
+                        && effective_volume
                             .SetMasterVolumeLevelScalar(1.0, &callback_context)
                             .is_err()
-                        {
-                            recovery_error = Some("Failed to restore microphone volume");
-                        }
+                    {
+                        recovery_error = Some("Failed to restore microphone volume");
                     }
 
                     if recovery_error.is_none() {
                         match read_stable_mic_state(&effective_volume, 1, 0) {
-                            Some(readback) if !readback.muted && !volume_needs_fix(readback.normalized_level) => {
+                            Some(readback)
+                                if !readback.muted
+                                    && !volume_needs_fix(readback.normalized_level) =>
+                            {
                                 let mut s = status_clone.lock().unwrap();
                                 if did_unmute {
                                     s.last_unmute = Some(Instant::now());
@@ -889,7 +975,7 @@ fn main() {
                                     s.fixes_count += 1;
                                 }
                                 s.error = None;
-                                s.last_action_reason = Some("write-verified".into());
+                                s.last_action_reason = ActionReason::WriteVerified;
                                 restore_verified = true;
                                 break;
                             }
@@ -907,7 +993,7 @@ fn main() {
 
                     {
                         let mut s = status_clone.lock().unwrap();
-                        s.last_action_reason = Some("write-failed".into());
+                        s.last_action_reason = ActionReason::WriteFailed;
                         s.write_failures += 1;
                         if write_attempts == 0 {
                             s.write_retries += 1;
@@ -933,7 +1019,6 @@ fn main() {
                                 break;
                             }
                         }
-                        continue;
                     }
 
                     break;
@@ -942,13 +1027,15 @@ fn main() {
                 if restore_verified {
                     set_status_error(&status_clone, None);
                 } else {
-                    set_status_error(&status_clone, Some("Failed to enforce microphone settings".into()));
+                    if let Ok(mut s) = status_clone.lock() {
+                        s.restore_misses += 1;
+                    }
+                    set_status_error(
+                        &status_clone,
+                        Some("Failed to enforce microphone settings".into()),
+                    );
                 }
-                restore_rate_limit_ms = if restore_verified {
-                    RESTORE_RATE_LIMIT_MS
-                } else {
-                    next_retry_delay(restore_rate_limit_ms)
-                };
+                restore_rate_limit_ms = RESTORE_RATE_LIMIT_MS;
                 notify_delay_ms = RETRY_DELAY_MIN_MS;
 
                 // Send notification with cooldown
@@ -962,18 +1049,12 @@ fn main() {
                     } else {
                         format!("Volume raised from {old_pct}% to 100%")
                     };
-                    let _ = notify_tx.send(msg);
+                    let _ = notify_tx.try_send(msg);
                     last_notify = Instant::now();
                 }
 
                 pending_external_change = None;
                 last_periodic_check = Instant::now();
-                let sleep_delay = if external_change_handling {
-                    Duration::from_millis(120)
-                } else {
-                    Duration::from_secs(1)
-                };
-                thread::sleep(sleep_delay);
             }
             if com_inited {
                 detach_mic(&mut mic);
@@ -992,23 +1073,81 @@ fn main() {
     let pause_item = CheckMenuItem::new("Paused", true, false, None);
     let startup_item = CheckMenuItem::new("Start with Windows", true, is_in_startup(), None);
     let quit_item = MenuItem::new("Quit", true, None);
-    menu.append(&device_item).unwrap();
-    menu.append(&volume_item).unwrap();
-    menu.append(&unmute_item).unwrap();
-    menu.append(&action_item).unwrap();
-    menu.append(&restore_item).unwrap();
-    menu.append(&PredefinedMenuItem::separator()).unwrap();
-    menu.append(&pause_item).unwrap();
-    menu.append(&startup_item).unwrap();
-    menu.append(&PredefinedMenuItem::separator()).unwrap();
-    menu.append(&quit_item).unwrap();
+    if let Err(err) = menu.append(&device_item) {
+        set_status_error(&status, Some(format!("Failed to build tray menu: {err}")));
+        running.store(false, Ordering::Release);
+        let _ = monitor_handle.join();
+        return;
+    }
+    if let Err(err) = menu.append(&volume_item) {
+        set_status_error(&status, Some(format!("Failed to build tray menu: {err}")));
+        running.store(false, Ordering::Release);
+        let _ = monitor_handle.join();
+        return;
+    }
+    if let Err(err) = menu.append(&unmute_item) {
+        set_status_error(&status, Some(format!("Failed to build tray menu: {err}")));
+        running.store(false, Ordering::Release);
+        let _ = monitor_handle.join();
+        return;
+    }
+    if let Err(err) = menu.append(&action_item) {
+        set_status_error(&status, Some(format!("Failed to build tray menu: {err}")));
+        running.store(false, Ordering::Release);
+        let _ = monitor_handle.join();
+        return;
+    }
+    if let Err(err) = menu.append(&restore_item) {
+        set_status_error(&status, Some(format!("Failed to build tray menu: {err}")));
+        running.store(false, Ordering::Release);
+        let _ = monitor_handle.join();
+        return;
+    }
+    if let Err(err) = menu.append(&PredefinedMenuItem::separator()) {
+        set_status_error(&status, Some(format!("Failed to build tray menu: {err}")));
+        running.store(false, Ordering::Release);
+        let _ = monitor_handle.join();
+        return;
+    }
+    if let Err(err) = menu.append(&pause_item) {
+        set_status_error(&status, Some(format!("Failed to build tray menu: {err}")));
+        running.store(false, Ordering::Release);
+        let _ = monitor_handle.join();
+        return;
+    }
+    if let Err(err) = menu.append(&startup_item) {
+        set_status_error(&status, Some(format!("Failed to build tray menu: {err}")));
+        running.store(false, Ordering::Release);
+        let _ = monitor_handle.join();
+        return;
+    }
+    if let Err(err) = menu.append(&PredefinedMenuItem::separator()) {
+        set_status_error(&status, Some(format!("Failed to build tray menu: {err}")));
+        running.store(false, Ordering::Release);
+        let _ = monitor_handle.join();
+        return;
+    }
+    if let Err(err) = menu.append(&quit_item) {
+        set_status_error(&status, Some(format!("Failed to build tray menu: {err}")));
+        running.store(false, Ordering::Release);
+        let _ = monitor_handle.join();
+        return;
+    }
 
-    let _tray = TrayIconBuilder::new()
+    let _tray = match TrayIconBuilder::new()
         .with_menu(Box::new(menu))
         .with_tooltip("Mic Volume Fix")
         .with_icon(create_icon(true))
         .build()
-        .expect("Failed to create tray icon");
+    {
+        Ok(tray) => tray,
+        Err(err) => {
+            set_status_error(&status, Some(format!("Failed to create tray icon: {err}")));
+            running.store(false, Ordering::Release);
+            let _ = monitor_handle.join();
+            return;
+        }
+    };
 
     let menu_receiver = MenuEvent::receiver().clone();
     let mut last_menu_update = Instant::now() - Duration::from_secs(1);
@@ -1069,54 +1208,47 @@ fn main() {
                     format!("Mic: {}", s.device_name)
                 };
                 if device_text != last_device_text {
-                    let _ = device_item.set_text(device_text.clone());
+                    device_item.set_text(device_text.clone());
                     last_device_text = device_text;
                 }
 
                 let volume_text = if let Some(t) = s.last_volume_fix {
                     let ago = format_duration(t.elapsed().as_secs());
-                    format!(
-                        "Volume fixed: {ago} ago (total: {})",
-                        s.fixes_count
-                    )
+                    format!("Volume fixed: {ago} ago (total: {})", s.fixes_count)
                 } else {
                     "Volume: no fixes needed yet".to_string()
                 };
                 if volume_text != last_volume_text {
-                    let _ = volume_item.set_text(volume_text.clone());
+                    volume_item.set_text(volume_text.clone());
                     last_volume_text = volume_text;
                 }
 
                 let unmute_text = if let Some(t) = s.last_unmute {
                     let ago = format_duration(t.elapsed().as_secs());
-                    format!(
-                        "Unmuted: {ago} ago (total: {})",
-                        s.unmutes_count
-                    )
+                    format!("Unmuted: {ago} ago (total: {})", s.unmutes_count)
                 } else {
                     "Unmute: no fixes needed yet".to_string()
                 };
                 if unmute_text != last_unmute_text {
-                    let _ = unmute_item.set_text(unmute_text.clone());
+                    unmute_item.set_text(unmute_text.clone());
                     last_unmute_text = unmute_text;
                 }
 
                 let action_text = if let Some(ref err) = s.error {
                     format!("Action: {err}")
-                } else if let Some(ref reason) = s.last_action_reason {
-                    format!("Action: {reason}")
                 } else {
-                    "Action: monitoring".to_string()
+                    format!("Action: {}", s.last_action_reason.label())
                 };
                 if action_text != last_action_text {
-                    let _ = action_item.set_text(action_text.clone());
+                    action_item.set_text(action_text.clone());
                     last_action_text = action_text;
                 }
 
                 let restore_text = format!(
-                    "Restore attempts: {} (misses: {}, reconnects: {}, write retries: {}, write fails: {}, verify fails: {}, callback reg fails: {})",
+                    "Restore attempts: {} (misses: {}, no-op cycles: {}, reconnects: {}, write retries: {}, write fails: {}, verify fails: {}, callback reg fails: {})",
                     s.restore_attempts,
                     s.restore_misses,
+                    s.restore_noop_cycles,
                     s.reconnects,
                     s.write_retries,
                     s.write_failures,
@@ -1124,7 +1256,7 @@ fn main() {
                     s.callback_registration_failures
                 );
                 if restore_text != last_restore_text {
-                    let _ = restore_item.set_text(restore_text.clone());
+                    restore_item.set_text(restore_text.clone());
                     last_restore_text = restore_text;
                 }
             }

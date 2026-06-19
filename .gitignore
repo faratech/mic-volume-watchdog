@@ -1,2 +1,55 @@
+# Rust targets and build output
 /target
-Cargo.lock
+**/target
+**/target/**
+
+# Compiled binary artifacts
+*.exe
+*.dll
+*.lib
+*.a
+*.o
+*.obj
+*.pdb
+*.so
+*.dylib
+
+# Build byproducts
+*.log
+*.tmp
+*.temp
+*.cache
+
+# Environment / editor noise
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# Rust toolchain state
+**/.cargo-home/
+**/.rustup/
+
+# Temporary workspace snapshots
+/.direnv/
+.env
+.env.*
+
+# Windows cross toolchain outputs
+*.d
+*.rlib
+*.rmeta
+
+# Keep dependency locks only if explicitly managed per-package
+# Uncomment if you prefer tracking all lockfiles:
+# */Cargo.lock
+
+# Ignore local release copies
+mic_volume_fix_latest.exe
+
+# Ignore third-party/Toolchain build artifacts only
+third_party/*/target/
+tools/*/target/
