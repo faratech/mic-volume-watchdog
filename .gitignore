@@ -1,7 +1,6 @@
-# Rust targets and build output
-/target
-**/target
-**/target/**
+# Rust build output
+/target/
+**/target/
 
 # Compiled binary artifacts
 *.exe
@@ -13,16 +12,20 @@
 *.pdb
 *.so
 *.dylib
+*.dSYM/
 
 # Build byproducts
 *.log
 *.tmp
 *.temp
 *.cache
+*.orig
+*.bak
+*.old
 
 # Environment / editor noise
-.vscode/
-.idea/
+**/.vscode/
+**/.idea/
 .DS_Store
 Thumbs.db
 *.swp
@@ -32,8 +35,9 @@ Thumbs.db
 # Rust toolchain state
 **/.cargo-home/
 **/.rustup/
+.cargo/
 
-# Temporary workspace snapshots
+# Local environment and workspace snapshots
 /.direnv/
 .env
 .env.*
@@ -43,13 +47,25 @@ Thumbs.db
 *.rlib
 *.rmeta
 
-# Keep dependency locks only if explicitly managed per-package
-# Uncomment if you prefer tracking all lockfiles:
-# */Cargo.lock
-
 # Ignore local release copies
-mic_volume_fix_latest.exe
+/mic_volume_fix_latest.exe
 
-# Ignore third-party/Toolchain build artifacts only
+# Vendored crate noise; keep Cargo.toml, source, README, and licenses.
+third_party/*/.cargo-ok
+third_party/*/.cargo_vcs_info.json
+third_party/*/.changes/
+third_party/*/.github/
+third_party/*/.git/
+third_party/*/Cargo.lock
+third_party/*/Cargo.toml.orig
+third_party/*/appveyor.yml
+third_party/*/.travis.yml
+third_party/*/renovate.json
+third_party/*/rustfmt.toml
+third_party/*/*.sublime-project
+third_party/*/examples/
+third_party/*/resources/test/
+
+# Nested tool build artifacts
 third_party/*/target/
 tools/*/target/
