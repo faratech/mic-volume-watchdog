@@ -19,6 +19,9 @@ use windows::{
 };
 
 const NOTIFY_COOLDOWN_SECS: u64 = 30;
+const VOLUME_RESTORE_THRESHOLD: f32 = 1.0;
+const RETRY_DELAY_MIN_MS: u64 = 500;
+const RETRY_DELAY_MAX_MS: u64 = 5_000;
 
 fn format_duration(total_secs: u64) -> String {
     if total_secs == 0 {
@@ -43,6 +46,21 @@ fn format_duration(total_secs: u64) -> String {
     if mins > 0 { parts.push(format!("{mins}m")); }
     if secs > 0 { parts.push(format!("{secs}s")); }
     parts.join(" ")
+}
+
+fn set_status_error(status: &Arc<Mutex<Status>>, message: Option<String>) {
+    if let Ok(mut s) = status.lock() {
+        s.error = message;
+    }
+}
+
+fn volume_needs_fix(level: f32) -> bool {
+    level < VOLUME_RESTORE_THRESHOLD
+}
+
+fn next_retry_delay(current_ms: u64) -> u64 {
+    let doubled = current_ms.saturating_mul(2);
+    doubled.min(RETRY_DELAY_MAX_MS)
 }
 
 struct Status {
@@ -233,7 +251,7 @@ fn is_in_startup() -> bool {
     }
 }
 
-fn set_startup(enable: bool) {
+fn set_startup(enable: bool) -> Result<(), String> {
     use windows_sys::Win32::System::Registry::*;
 
     unsafe {
@@ -252,26 +270,33 @@ fn set_startup(enable: bool) {
             &mut hkey,
         );
         if result != 0 {
-            return;
+            return Err(format!("Failed to open startup key: 0x{:08X}", result));
         }
 
-        if enable {
-            if let Some(exe) = get_exe_path() {
-                let value: Vec<u16> = format!("\"{exe}\"\0").encode_utf16().collect();
-                RegSetValueExW(
-                    hkey,
-                    value_name.as_ptr(),
-                    0,
-                    REG_SZ,
-                    value.as_ptr() as *const u8,
-                    (value.len() * 2) as u32,
-                );
-            }
+        let status = if enable {
+            let exe = get_exe_path().ok_or_else(|| "Failed to resolve executable path".to_string())?;
+            let value: Vec<u16> = format!("\"{exe}\"\0").encode_utf16().collect();
+            RegSetValueExW(
+                hkey,
+                value_name.as_ptr(),
+                0,
+                REG_SZ,
+                value.as_ptr() as *const u8,
+                (value.len() * 2) as u32,
+            )
         } else {
-            RegDeleteValueW(hkey, value_name.as_ptr());
-        }
+            RegDeleteValueW(hkey, value_name.as_ptr())
+        };
 
         RegCloseKey(hkey);
+
+        if status == 0 {
+            Ok(())
+        } else if enable {
+            Err(format!("Failed to enable startup entry: 0x{:08X}", status))
+        } else {
+            Err(format!("Failed to disable startup entry: 0x{:08X}", status))
+        }
     }
 }
 
@@ -291,7 +316,7 @@ fn acquire_mic(
     unsafe {
         let device: IMMDevice = enumerator.GetDefaultAudioEndpoint(eCapture, eConsole).ok()?;
 
-        let device_id = device.GetId().ok()?.to_string().unwrap_or_default();
+        let device_id = device.GetId().ok()?.to_string().ok()?;
 
         let props: IPropertyStore = device.OpenPropertyStore(STGM_READ).ok()?;
         let name = props.GetValue(&PKEY_Device_FriendlyName).ok()?;
@@ -319,37 +344,81 @@ fn main() {
     }));
 
     let (notify_tx, notify_rx) = mpsc::channel::<String>();
+    let running = Arc::new(AtomicBool::new(true));
 
     let status_clone = status.clone();
     let paused_clone = paused.clone();
-    thread::spawn(move || {
-        unsafe {
-            CoInitializeEx(None, COINIT_MULTITHREADED)
-                .ok()
-                .expect("COM init failed");
+    let running_clone = running.clone();
 
-            let enumerator: IMMDeviceEnumerator =
-                CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).expect("No enumerator");
+    let monitor_handle = thread::spawn(move || {
+        unsafe {
+            let mut com_inited = false;
+            let mut enumerator: Option<IMMDeviceEnumerator> = None;
+            let mut notify_delay_ms = RETRY_DELAY_MIN_MS;
+            let mut enumerator_delay_ms = RETRY_DELAY_MIN_MS;
 
             let mut mic: Option<(String, String, IAudioEndpointVolume)> = None;
             let mut last_notify = Instant::now() - Duration::from_secs(NOTIFY_COOLDOWN_SECS);
             let mut iteration: u32 = 0;
 
             loop {
+                if !running_clone.load(Ordering::Acquire) {
+                    break;
+                }
+
                 // If paused, just sleep
                 if paused_clone.load(Ordering::Relaxed) {
                     thread::sleep(Duration::from_secs(1));
                     continue;
                 }
 
+                if !com_inited {
+                    match CoInitializeEx(None, COINIT_MULTITHREADED) {
+                        Ok(()) => {
+                            com_inited = true;
+                        }
+                        Err(err) => {
+                            set_status_error(
+                                &status_clone,
+                                Some(format!("COM initialization failed: {err}")),
+                            );
+                            thread::sleep(Duration::from_millis(notify_delay_ms));
+                            notify_delay_ms = next_retry_delay(notify_delay_ms);
+                            continue;
+                        }
+                    }
+                }
+
+                if enumerator.is_none() {
+                    match CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) {
+                        Ok(device_enumerator) => {
+                            enumerator = Some(device_enumerator);
+                            enumerator_delay_ms = RETRY_DELAY_MIN_MS;
+                        }
+                        Err(err) => {
+                            set_status_error(
+                                &status_clone,
+                                Some(format!("Failed to create device enumerator: {err}")),
+                            );
+                            thread::sleep(Duration::from_millis(enumerator_delay_ms));
+                            enumerator_delay_ms = next_retry_delay(enumerator_delay_ms);
+                            continue;
+                        }
+                    }
+                }
+
+                let enumerator = enumerator.as_ref().expect("enumerator missing");
+
                 // Try to acquire mic if we don't have one
                 if mic.is_none() {
-                    match acquire_mic(&enumerator) {
+                    match acquire_mic(enumerator) {
                         Some((id, name, vol)) => {
                             let mut s = status_clone.lock().unwrap();
                             s.device_name = name.clone();
                             s.error = None;
                             mic = Some((id, name, vol));
+                            notify_delay_ms = RETRY_DELAY_MIN_MS;
+                            enumerator_delay_ms = RETRY_DELAY_MIN_MS;
                         }
                         None => {
                             let mut s = status_clone.lock().unwrap();
@@ -368,9 +437,22 @@ fn main() {
                         let current_id = &mic.as_ref().unwrap().0;
                         if &new_id != current_id {
                             // Default device changed — re-acquire
+                            {
+                                let mut s = status_clone.lock().unwrap();
+                                s.error = Some("Default microphone changed, reconnecting...".into());
+                            }
                             mic = None;
+                            notify_delay_ms = RETRY_DELAY_MIN_MS;
+                            enumerator_delay_ms = RETRY_DELAY_MIN_MS;
                             continue;
                         }
+                    } else {
+                        let mut s = status_clone.lock().unwrap();
+                        s.error = Some("Failed to read default microphone ID".into());
+                        mic = None;
+                        thread::sleep(Duration::from_millis(notify_delay_ms));
+                        notify_delay_ms = next_retry_delay(notify_delay_ms);
+                        continue;
                     }
                 }
 
@@ -378,8 +460,8 @@ fn main() {
 
                 let mut did_unmute = false;
                 let mut did_fix_volume = false;
-                #[allow(unused_assignments)]
                 let mut old_pct = 100u32;
+                let mut had_recoverable_error = false;
 
                 // Check mute — if the call fails, the device is gone
                 match volume.GetMute() {
@@ -389,14 +471,23 @@ fn main() {
                             s.last_unmute = Some(Instant::now());
                             s.unmutes_count += 1;
                             did_unmute = true;
+                        } else {
+                            had_recoverable_error = true;
+                            set_status_error(
+                                &status_clone,
+                                Some("Failed to unmute microphone".into()),
+                            );
                         }
                     }
                     Err(_) => {
                         // Device lost — drop and re-acquire next loop
                         mic = None;
-                        let mut s = status_clone.lock().unwrap();
-                        s.error = Some("Microphone disconnected, reconnecting...".into());
-                        thread::sleep(Duration::from_secs(2));
+                        {
+                            let mut s = status_clone.lock().unwrap();
+                            s.error = Some("Microphone disconnected, reconnecting...".into());
+                        }
+                        thread::sleep(Duration::from_millis(notify_delay_ms));
+                        notify_delay_ms = next_retry_delay(notify_delay_ms);
                         continue;
                     }
                     _ => {}
@@ -404,25 +495,47 @@ fn main() {
 
                 match volume.GetMasterVolumeLevelScalar() {
                     Ok(current) => {
-                        old_pct = (current * 100.0).round() as u32;
-                        if old_pct < 100 {
-                            if volume.SetMasterVolumeLevelScalar(1.0, std::ptr::null()).is_ok() {
+                        let normalized = current.clamp(0.0, 1.0);
+                        old_pct = (normalized * 100.0).round() as u32;
+                        if volume_needs_fix(normalized) {
+                            if volume
+                                .SetMasterVolumeLevelScalar(1.0, std::ptr::null())
+                                .is_ok()
+                            {
                                 let mut s = status_clone.lock().unwrap();
                                 s.last_volume_fix = Some(Instant::now());
                                 s.fixes_count += 1;
                                 did_fix_volume = true;
+                            } else {
+                                had_recoverable_error = true;
+                                set_status_error(
+                                    &status_clone,
+                                    Some("Failed to restore microphone volume".into()),
+                                );
                             }
                         }
                     }
                     Err(_) => {
                         // Device lost — drop and re-acquire next loop
                         mic = None;
-                        let mut s = status_clone.lock().unwrap();
-                        s.error = Some("Microphone disconnected, reconnecting...".into());
-                        thread::sleep(Duration::from_secs(2));
+                        {
+                            let mut s = status_clone.lock().unwrap();
+                            s.error = Some("Microphone disconnected, reconnecting...".into());
+                        }
+                        thread::sleep(Duration::from_millis(notify_delay_ms));
+                        notify_delay_ms = next_retry_delay(notify_delay_ms);
                         continue;
                     }
                 }
+
+                if had_recoverable_error {
+                    thread::sleep(Duration::from_millis(notify_delay_ms));
+                    notify_delay_ms = next_retry_delay(notify_delay_ms);
+                    continue;
+                }
+
+                set_status_error(&status_clone, None);
+                notify_delay_ms = RETRY_DELAY_MIN_MS;
 
                 // Send notification with cooldown
                 if (did_unmute || did_fix_volume)
@@ -440,6 +553,9 @@ fn main() {
                 }
 
                 thread::sleep(Duration::from_secs(1));
+            }
+            if com_inited {
+                CoUninitialize();
             }
         }
     });
@@ -470,10 +586,16 @@ fn main() {
 
     let menu_receiver = MenuEvent::receiver().clone();
     let mut last_menu_update = Instant::now() - Duration::from_secs(1);
+    let mut last_device_text = String::new();
+    let mut last_volume_text = String::new();
+    let mut last_unmute_text = String::new();
+    let mut should_quit = false;
 
     'main: loop {
-        if let Ok(event) = menu_receiver.try_recv() {
+        while let Ok(event) = menu_receiver.try_recv() {
             if event.id() == quit_item.id() {
+                running.store(false, Ordering::Release);
+                should_quit = true;
                 break;
             } else if event.id() == pause_item.id() {
                 let is_paused = pause_item.is_checked();
@@ -485,7 +607,14 @@ fn main() {
                     Some("Mic Volume Fix")
                 });
             } else if event.id() == startup_item.id() {
-                set_startup(startup_item.is_checked());
+                let is_enabled = startup_item.is_checked();
+                match set_startup(is_enabled) {
+                    Ok(()) => set_status_error(&status, None),
+                    Err(err) => {
+                        startup_item.set_checked(!is_enabled);
+                        set_status_error(&status, Some(format!("Startup update failed: {err}")));
+                    }
+                }
             }
         }
 
@@ -504,32 +633,50 @@ fn main() {
         if last_menu_update.elapsed().as_secs() >= 1 {
             last_menu_update = Instant::now();
             if let Ok(s) = status.lock() {
-                if let Some(ref err) = s.error {
-                    device_item.set_text(format!("Mic: {err}"));
-                } else if !s.device_name.is_empty() {
-                    device_item.set_text(format!("Mic: {}", s.device_name));
+                let device_text = if let Some(ref err) = s.error {
+                    format!("Mic: {err}")
+                } else if s.device_name.is_empty() {
+                    "Mic: no device".to_string()
+                } else {
+                    format!("Mic: {}", s.device_name)
+                };
+                if device_text != last_device_text {
+                    let _ = device_item.set_text(device_text.clone());
+                    last_device_text = device_text;
                 }
 
-                if let Some(t) = s.last_volume_fix {
+                let volume_text = if let Some(t) = s.last_volume_fix {
                     let ago = format_duration(t.elapsed().as_secs());
-                    volume_item.set_text(format!(
+                    format!(
                         "Volume fixed: {ago} ago (total: {})",
                         s.fixes_count
-                    ));
+                    )
                 } else {
-                    volume_item.set_text("Volume: no fixes needed yet");
+                    "Volume: no fixes needed yet".to_string()
+                };
+                if volume_text != last_volume_text {
+                    let _ = volume_item.set_text(volume_text.clone());
+                    last_volume_text = volume_text;
                 }
 
-                if let Some(t) = s.last_unmute {
+                let unmute_text = if let Some(t) = s.last_unmute {
                     let ago = format_duration(t.elapsed().as_secs());
-                    unmute_item.set_text(format!(
+                    format!(
                         "Unmuted: {ago} ago (total: {})",
                         s.unmutes_count
-                    ));
+                    )
                 } else {
-                    unmute_item.set_text("Unmute: no fixes needed yet");
+                    "Unmute: no fixes needed yet".to_string()
+                };
+                if unmute_text != last_unmute_text {
+                    let _ = unmute_item.set_text(unmute_text.clone());
+                    last_unmute_text = unmute_text;
                 }
             }
+        }
+
+        if should_quit {
+            break 'main;
         }
 
         // Pump Win32 messages
@@ -546,5 +693,10 @@ fn main() {
         }
 
         thread::sleep(Duration::from_millis(100));
+    }
+
+    running.store(false, Ordering::Release);
+    if let Err(_join_err) = monitor_handle.join() {
+        let _ = _join_err;
     }
 }
