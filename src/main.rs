@@ -24,6 +24,12 @@ const NOTIFY_COOLDOWN_SECS: u64 = 30;
 const VOLUME_RESTORE_THRESHOLD: f32 = 1.0;
 const RETRY_DELAY_MIN_MS: u64 = 500;
 const RETRY_DELAY_MAX_MS: u64 = 5_000;
+const EXTERNAL_DEBOUNCE_WINDOW_MS: u64 = 100;
+const EXTERNAL_DEBOUNCE_SAMPLES: u32 = 3;
+const EXTERNAL_DEBOUNCE_STEP_MS: u64 = 45;
+const PERIODIC_RESTORE_CONFIRMATIONS: u32 = 2;
+const RESTORE_RATE_LIMIT_MS: u64 = 250;
+const RESTORE_RATE_LIMIT_MAX_MS: u64 = 2_000;
 const MIC_FIXER_CONTEXT: GUID = GUID::from_u128(0x5e4f84ce_2b8f_4a74_b7f8_1b7f9d4e1c6a);
 
 #[implement(IAudioEndpointVolumeCallback)]
@@ -92,7 +98,30 @@ struct Status {
     last_unmute: Option<Instant>,
     fixes_count: u32,
     unmutes_count: u32,
+    reconnects: u32,
+    callback_registration_failures: u32,
+    write_retries: u32,
+    write_failures: u32,
+    post_write_verify_failures: u32,
+    restore_attempts: u32,
+    restore_misses: u32,
     error: Option<String>,
+    last_action_reason: Option<String>,
+}
+
+struct MicHandle {
+    id: String,
+    name: String,
+    volume: IAudioEndpointVolume,
+    callback: Option<IAudioEndpointVolumeCallback>,
+    callback_registered: bool,
+}
+
+#[derive(Clone, Copy)]
+struct MicReading {
+    muted: bool,
+    normalized_level: f32,
+    percent: u32,
 }
 
 fn create_icon(active: bool) -> Icon {
@@ -331,11 +360,171 @@ fn get_default_mic_id(enumerator: &IMMDeviceEnumerator) -> Option<String> {
     }
 }
 
+fn get_mic_reading(volume: &IAudioEndpointVolume) -> Option<MicReading> {
+    unsafe {
+        let muted = volume.GetMute().ok()?;
+        let level = volume.GetMasterVolumeLevelScalar().ok()?;
+        let normalized = level.clamp(0.0, 1.0);
+        Some(MicReading {
+            muted: muted.as_bool(),
+            normalized_level: normalized,
+            percent: (normalized * 100.0).round() as u32,
+        })
+    }
+}
+
+fn read_stable_mic_state(
+    volume: &IAudioEndpointVolume,
+    sample_count: u32,
+    sample_step_ms: u64,
+) -> Option<MicReading> {
+    if sample_count == 0 {
+        return None;
+    }
+
+    let first = get_mic_reading(volume)?;
+    let baseline_muted = first.muted;
+    let baseline_needs_fix = volume_needs_fix(first.normalized_level);
+
+    for _ in 1..sample_count {
+        if sample_step_ms > 0 {
+            thread::sleep(Duration::from_millis(sample_step_ms));
+        }
+
+        let next = get_mic_reading(volume)?;
+        if next.muted != baseline_muted
+            || volume_needs_fix(next.normalized_level) != baseline_needs_fix
+        {
+            return None;
+        }
+    }
+
+    Some(first)
+}
+
+fn register_mic_callback(
+    mic: &mut MicHandle,
+    callback_tx: &mpsc::Sender<()>,
+    callback_context: GUID,
+    status: &Arc<Mutex<Status>>,
+) -> Option<IAudioEndpointVolumeCallback> {
+    let callback = VolumeCallback {
+        tx: callback_tx.clone(),
+        allowed_context: callback_context,
+    }
+    .into();
+
+    if mic.volume.RegisterControlChangeNotify(&callback).is_ok() {
+        Some(callback)
+    } else {
+        let mut s = status.lock().unwrap();
+        s.callback_registration_failures += 1;
+        s.last_action_reason = Some("callback registration failed".into());
+        None
+    }
+}
+
+fn acquire_mic_with_callback(
+    enumerator: &IMMDeviceEnumerator,
+    callback_tx: &mpsc::Sender<()>,
+    callback_context: GUID,
+    status: &Arc<Mutex<Status>>,
+) -> Option<MicHandle> {
+    let mut new_mic = acquire_mic(enumerator)?;
+    let callback = register_mic_callback(&mut new_mic, callback_tx, callback_context, status);
+    new_mic.callback_registered = callback.is_some();
+    new_mic.callback = callback;
+
+    let mut s = status.lock().unwrap();
+    s.device_name = new_mic.name.clone();
+    s.error = None;
+
+    Some(new_mic)
+}
+
+fn ensure_default_mic_for_write(
+    enumerator: &IMMDeviceEnumerator,
+    expected_mic_id: &str,
+    force_refresh: bool,
+    callback_tx: &mpsc::Sender<()>,
+    callback_context: GUID,
+    status: &Arc<Mutex<Status>>,
+    mic: &mut Option<MicHandle>,
+) -> Option<IAudioEndpointVolume> {
+    let current_default = match get_default_mic_id(enumerator) {
+        Some(current_default) => current_default,
+        None => {
+            {
+                let mut s = status.lock().unwrap();
+                s.reconnects += 1;
+                s.error = Some("Failed to verify default microphone".into());
+                s.last_action_reason = Some("reconnect".into());
+            }
+            detach_mic(mic);
+            return None;
+        }
+    };
+
+    if current_default != expected_mic_id {
+        {
+            let mut s = status.lock().unwrap();
+            s.reconnects += 1;
+            s.error = Some("Default microphone changed, reconnecting...".into());
+            s.last_action_reason = Some("reconnect".into());
+        }
+        detach_mic(mic);
+        return None;
+    }
+
+    if !force_refresh {
+        if let Some(existing) = mic.as_ref() {
+            return Some(existing.volume.clone());
+        }
+
+        {
+            let mut s = status.lock().unwrap();
+            s.reconnects += 1;
+            s.error = Some("Microphone handle missing, reconnecting...".into());
+            s.last_action_reason = Some("reconnect".into());
+        }
+        return None;
+    }
+
+    let refreshed = match acquire_mic_with_callback(enumerator, callback_tx, callback_context, status) {
+        Some(refreshed) => refreshed,
+        None => {
+            detach_mic(mic);
+            return None;
+        }
+    };
+
+    let volume = refreshed.volume.clone();
+    if refreshed.id != expected_mic_id {
+        {
+            let mut s = status.lock().unwrap();
+            s.reconnects += 1;
+            s.error = Some("Default microphone changed, reconnecting...".into());
+            s.last_action_reason = Some("reconnect".into());
+        }
+        detach_mic(mic);
+        return None;
+    }
+
+    {
+        let mut s = status.lock().unwrap();
+        s.reconnects += 1;
+        s.last_action_reason = Some("reconnect".into());
+    }
+
+    *mic = Some(refreshed);
+    Some(volume)
+}
+
 /// Try to get the default capture device and its volume control.
-/// Returns (device_id, device_name, IAudioEndpointVolume) or None if no mic.
+/// Returns a tracked capture-device handle or None if no mic.
 fn acquire_mic(
     enumerator: &IMMDeviceEnumerator,
-) -> Option<(String, String, IAudioEndpointVolume)> {
+) -> Option<MicHandle> {
     unsafe {
         let device: IMMDevice = enumerator.GetDefaultAudioEndpoint(eCapture, eConsole).ok()?;
 
@@ -348,16 +537,24 @@ fn acquire_mic(
             .unwrap_or_else(|_| "Unknown".into());
 
         let volume: IAudioEndpointVolume = device.Activate(CLSCTX_ALL, None).ok()?;
-        Some((device_id, name_str, volume))
+        Some(MicHandle {
+            id: device_id,
+            name: name_str,
+            volume,
+            callback: None,
+            callback_registered: false,
+        })
     }
 }
 
 fn detach_mic(
-    mic: &mut Option<(String, String, IAudioEndpointVolume, Option<IAudioEndpointVolumeCallback>)>,
+    mic: &mut Option<MicHandle>,
 ) {
-    if let Some((_id, _name, volume, callback)) = mic.take() {
-        if let Some(callback) = callback {
-            let _ = unsafe { volume.UnregisterControlChangeNotify(&callback) };
+    if let Some(mut inner) = mic.take() {
+        if inner.callback_registered {
+            if let Some(callback) = inner.callback.take() {
+                let _ = unsafe { inner.volume.UnregisterControlChangeNotify(&callback) };
+            }
         }
     }
 }
@@ -373,7 +570,15 @@ fn main() {
         last_unmute: None,
         fixes_count: 0,
         unmutes_count: 0,
+        reconnects: 0,
+        callback_registration_failures: 0,
+        write_retries: 0,
+        write_failures: 0,
+        post_write_verify_failures: 0,
+        restore_attempts: 0,
+        restore_misses: 0,
         error: None,
+        last_action_reason: Some("Starting".into()),
     }));
 
     let (notify_tx, notify_rx) = mpsc::channel::<String>();
@@ -392,19 +597,27 @@ fn main() {
             let mut enumerator_delay_ms = RETRY_DELAY_MIN_MS;
             let callback_context = MIC_FIXER_CONTEXT;
 
-            let mut mic: Option<(String, String, IAudioEndpointVolume, Option<IAudioEndpointVolumeCallback>)> =
-                None;
+            let mut mic: Option<MicHandle> = None;
             let mut last_notify = Instant::now() - Duration::from_secs(NOTIFY_COOLDOWN_SECS);
-            let mut iteration: u32 = 0;
+            let mut pending_external_change: Option<Instant> = None;
+            let mut last_restore_action = Instant::now() - Duration::from_millis(RESTORE_RATE_LIMIT_MS);
+            let mut restore_rate_limit_ms = RESTORE_RATE_LIMIT_MS;
+            let mut last_periodic_check = Instant::now() - Duration::from_secs(1);
+            let mut periodic_miss_streak = 0u32;
+            let mut external_change_handling;
 
             loop {
                 if !running_clone.load(Ordering::Acquire) {
                     break;
                 }
 
-                let mut external_change = false;
+                let mut callback_hit = false;
                 while let Ok(()) = callback_rx.try_recv() {
-                    external_change = true;
+                    callback_hit = true;
+                }
+
+                if callback_hit {
+                    pending_external_change = Some(Instant::now());
                 }
 
                 // If paused, just sleep
@@ -450,147 +663,292 @@ fn main() {
 
                 // Try to acquire mic if we don't have one
                 if mic.is_none() {
-                    match acquire_mic(enumerator) {
-                        Some((id, name, vol)) => {
-                            let callback: Option<IAudioEndpointVolumeCallback> = {
-                                let callback = VolumeCallback {
-                                    tx: callback_tx.clone(),
-                                    allowed_context: callback_context,
-                                }
-                                .into();
+                    match acquire_mic_with_callback(
+                        enumerator,
+                        &callback_tx,
+                        callback_context,
+                        &status_clone,
+                    ) {
 
-                                if vol.RegisterControlChangeNotify(&callback).is_ok() {
-                                    Some(callback)
-                                } else {
-                                    None
-                                }
-                            };
-
-                            let mut s = status_clone.lock().unwrap();
-                            s.device_name = name.clone();
-                            s.error = None;
-                            mic = Some((id, name, vol, callback));
-                            notify_delay_ms = RETRY_DELAY_MIN_MS;
-                            enumerator_delay_ms = RETRY_DELAY_MIN_MS;
-                        }
                         None => {
-                            let mut s = status_clone.lock().unwrap();
-                            s.device_name.clear();
-                            s.error = Some("No microphone detected".into());
-                            thread::sleep(Duration::from_secs(5));
+                            thread::sleep(Duration::from_millis(notify_delay_ms));
+                            notify_delay_ms = next_retry_delay(notify_delay_ms);
                             continue;
                         }
-                    }
-                }
 
-                // Periodically check if the default device has changed
-                iteration = iteration.wrapping_add(1);
-                if iteration % 10 == 0 {
-                    if let Some(new_id) = get_default_mic_id(&enumerator) {
-                        let current_id = &mic.as_ref().unwrap().0;
-                        if &new_id != current_id {
-                            // Default device changed — re-acquire
-                            {
-                                let mut s = status_clone.lock().unwrap();
-                                s.error = Some("Default microphone changed, reconnecting...".into());
-                            }
-                            detach_mic(&mut mic);
+                        Some(new_mic) => {
+                            let mut s = status_clone.lock().unwrap();
+                            s.last_action_reason = Some("acquired default mic".into());
+                            mic = Some(new_mic);
                             notify_delay_ms = RETRY_DELAY_MIN_MS;
                             enumerator_delay_ms = RETRY_DELAY_MIN_MS;
-                            continue;
                         }
-                    } else {
-                        let mut s = status_clone.lock().unwrap();
-                        s.error = Some("Failed to read default microphone ID".into());
-                        detach_mic(&mut mic);
-                        thread::sleep(Duration::from_millis(notify_delay_ms));
-                        notify_delay_ms = next_retry_delay(notify_delay_ms);
-                        continue;
                     }
                 }
 
-                let (_id, _name, volume, _callback) = mic.as_ref().unwrap();
-
-                let mut did_unmute = false;
-                let mut did_fix_volume = false;
-                let mut old_pct = 100u32;
-                let mut had_recoverable_error = false;
-
-                // Check mute — if the call fails, the device is gone
-                match volume.GetMute() {
-                    Ok(muted) if muted.as_bool() => {
-                        if volume
-                            .SetMute(false, &callback_context)
-                            .is_ok()
-                        {
-                            let mut s = status_clone.lock().unwrap();
-                            s.last_unmute = Some(Instant::now());
-                            s.unmutes_count += 1;
-                            did_unmute = true;
-                        } else {
-                            had_recoverable_error = true;
-                            set_status_error(
-                                &status_clone,
-                                Some("Failed to unmute microphone".into()),
-                            );
-                        }
-                    }
-                    Err(_) => {
-                        // Device lost — drop and re-acquire next loop
-                        detach_mic(&mut mic);
-                        {
-                            let mut s = status_clone.lock().unwrap();
-                            s.error = Some("Microphone disconnected, reconnecting...".into());
-                        }
-                        thread::sleep(Duration::from_millis(notify_delay_ms));
-                        notify_delay_ms = next_retry_delay(notify_delay_ms);
-                        continue;
-                    }
-                    _ => {}
-                }
-
-                match volume.GetMasterVolumeLevelScalar() {
-                    Ok(current) => {
-                        let normalized = current.clamp(0.0, 1.0);
-                        old_pct = (normalized * 100.0).round() as u32;
-                        if volume_needs_fix(normalized) {
-                            if volume
-                                .SetMasterVolumeLevelScalar(1.0, &callback_context)
-                                .is_ok()
-                            {
-                                let mut s = status_clone.lock().unwrap();
-                                s.last_volume_fix = Some(Instant::now());
-                                s.fixes_count += 1;
-                                did_fix_volume = true;
-                            } else {
-                                had_recoverable_error = true;
-                                set_status_error(
-                                    &status_clone,
-                                    Some("Failed to restore microphone volume".into()),
-                                );
-                            }
-                        }
-                    }
-                    Err(_) => {
-                        // Device lost — drop and re-acquire next loop
-                        detach_mic(&mut mic);
-                        {
-                            let mut s = status_clone.lock().unwrap();
-                            s.error = Some("Microphone disconnected, reconnecting...".into());
-                        }
-                        thread::sleep(Duration::from_millis(notify_delay_ms));
-                        notify_delay_ms = next_retry_delay(notify_delay_ms);
-                        continue;
-                    }
-                }
-
-                if had_recoverable_error {
-                    thread::sleep(Duration::from_millis(notify_delay_ms));
-                    notify_delay_ms = next_retry_delay(notify_delay_ms);
+                let now = Instant::now();
+                let due_periodic = now.duration_since(last_periodic_check) >= Duration::from_secs(1);
+                external_change_handling = if let Some(change_time) = pending_external_change {
+                    now.duration_since(change_time) >= Duration::from_millis(EXTERNAL_DEBOUNCE_WINDOW_MS)
+                } else {
+                    false
+                };
+                if !due_periodic && !external_change_handling {
+                    thread::sleep(Duration::from_millis(40));
                     continue;
                 }
 
-                set_status_error(&status_clone, None);
+                let (current_mic_id, volume) = {
+                    let mic_ref = mic.as_ref().expect("mic missing");
+                    (mic_ref.id.clone(), mic_ref.volume.clone())
+                };
+                let is_periodic_check = due_periodic && !external_change_handling;
+                match get_default_mic_id(enumerator) {
+                    Some(current_default_id) if current_default_id == current_mic_id => {
+                        // Still default: proceed.
+                        last_periodic_check = now;
+                    }
+                    Some(_) => {
+                        {
+                            let mut s = status_clone.lock().unwrap();
+                            s.error = Some("Default microphone changed, reconnecting...".into());
+                            s.last_action_reason = Some("Default mic changed".into());
+                            s.reconnects += 1;
+                        }
+                        detach_mic(&mut mic);
+                        restore_rate_limit_ms = RESTORE_RATE_LIMIT_MS;
+                        notify_delay_ms = RETRY_DELAY_MIN_MS;
+                        enumerator_delay_ms = RETRY_DELAY_MIN_MS;
+                        pending_external_change = None;
+                        continue;
+                    }
+                    None => {
+                        {
+                            let mut s = status_clone.lock().unwrap();
+                            s.error = Some("Failed to verify default microphone".into());
+                            s.last_action_reason = Some("Default mic check failed".into());
+                            s.reconnects += 1;
+                        }
+                        detach_mic(&mut mic);
+                        restore_rate_limit_ms = RESTORE_RATE_LIMIT_MS;
+                        thread::sleep(Duration::from_millis(notify_delay_ms));
+                        notify_delay_ms = next_retry_delay(notify_delay_ms);
+                        pending_external_change = None;
+                        continue;
+                    }
+                }
+
+                let sample_count = if external_change_handling {
+                    EXTERNAL_DEBOUNCE_SAMPLES
+                } else {
+                    1
+                };
+
+                let mut did_unmute = false;
+                let mut did_fix_volume = false;
+                let mut old_pct = 0u32;
+                let state = read_stable_mic_state(&volume, sample_count, EXTERNAL_DEBOUNCE_STEP_MS);
+
+                if let Some(reading) = state {
+                    did_unmute = reading.muted;
+                    did_fix_volume = volume_needs_fix(reading.normalized_level);
+                    old_pct = reading.percent;
+                } else {
+                    detach_mic(&mut mic);
+                    {
+                        let mut s = status_clone.lock().unwrap();
+                        s.reconnects += 1;
+                        s.error = Some("Microphone state unstable, reconnecting...".into());
+                        s.last_action_reason = Some("reconnect".into());
+                    }
+                    restore_rate_limit_ms = RESTORE_RATE_LIMIT_MS;
+                    thread::sleep(Duration::from_millis(notify_delay_ms));
+                    notify_delay_ms = next_retry_delay(notify_delay_ms);
+                    pending_external_change = None;
+                    continue;
+                }
+
+                if !did_unmute && !did_fix_volume {
+                    periodic_miss_streak = 0;
+                    {
+                        let mut s = status_clone.lock().unwrap();
+                        s.restore_misses += 1;
+                        s.error = None;
+                        s.last_action_reason = if is_periodic_check {
+                            Some("Periodic check stable".into())
+                        } else {
+                            Some("No restore needed".into())
+                        };
+                    }
+                    notify_delay_ms = RETRY_DELAY_MIN_MS;
+                    restore_rate_limit_ms = RESTORE_RATE_LIMIT_MS;
+                    pending_external_change = None;
+                    last_periodic_check = now;
+                    continue;
+                }
+
+                if is_periodic_check {
+                    periodic_miss_streak = periodic_miss_streak.saturating_add(1);
+                } else {
+                    periodic_miss_streak = 0;
+                }
+
+                if is_periodic_check && periodic_miss_streak < PERIODIC_RESTORE_CONFIRMATIONS {
+                    {
+                        let mut s = status_clone.lock().unwrap();
+                        s.restore_misses += 1;
+                        s.error = None;
+                        s.last_action_reason = Some(format!(
+                            "Periodic drift confirmed ({}/{})",
+                            periodic_miss_streak, PERIODIC_RESTORE_CONFIRMATIONS
+                        ));
+                    }
+                    pending_external_change = None;
+                    last_periodic_check = now;
+                    thread::sleep(Duration::from_millis(120));
+                    continue;
+                }
+
+                periodic_miss_streak = 0;
+
+                if external_change_handling
+                    && now.duration_since(last_restore_action)
+                        < Duration::from_millis(restore_rate_limit_ms)
+                {
+                    let elapsed_ms = now.duration_since(last_restore_action).as_millis() as u64;
+                    let wait_ms = restore_rate_limit_ms.saturating_sub(elapsed_ms);
+                    restore_rate_limit_ms = next_retry_delay(restore_rate_limit_ms);
+                    restore_rate_limit_ms = restore_rate_limit_ms.min(RESTORE_RATE_LIMIT_MAX_MS);
+                    {
+                        let mut s = status_clone.lock().unwrap();
+                        s.last_action_reason =
+                            Some(format!("Restore rate limited ({wait_ms}ms cooldown, burst cap {restore_rate_limit_ms}ms)").into());
+                    }
+                    thread::sleep(Duration::from_millis(wait_ms.min(restore_rate_limit_ms)));
+                    continue;
+                }
+
+                let mut effective_volume = match ensure_default_mic_for_write(
+                    enumerator,
+                    &current_mic_id,
+                    false,
+                    &callback_tx,
+                    callback_context,
+                    &status_clone,
+                    &mut mic,
+                ) {
+                    Some(volume) => volume,
+                    None => {
+                    restore_rate_limit_ms = RESTORE_RATE_LIMIT_MS;
+                    notify_delay_ms = next_retry_delay(notify_delay_ms);
+                    continue;
+                    }
+                }
+
+                {
+                    let mut s = status_clone.lock().unwrap();
+                    s.restore_attempts += 1;
+                    s.last_action_reason = if external_change_handling {
+                        Some("external-change".into())
+                    } else {
+                        Some("periodic-check".into())
+                    };
+                }
+                last_restore_action = Instant::now();
+
+                let mut restore_verified = false;
+                let mut write_attempts = 0;
+                while write_attempts < 2 {
+                    let mut recovery_error = None;
+
+                    if did_unmute {
+                        if effective_volume.SetMute(false, &callback_context).is_err() {
+                            recovery_error = Some("Failed to unmute microphone");
+                        }
+                    }
+
+                    if did_fix_volume {
+                        if effective_volume
+                            .SetMasterVolumeLevelScalar(1.0, &callback_context)
+                            .is_err()
+                        {
+                            recovery_error = Some("Failed to restore microphone volume");
+                        }
+                    }
+
+                    if recovery_error.is_none() {
+                        match read_stable_mic_state(&effective_volume, 1, 0) {
+                            Some(readback) if !readback.muted && !volume_needs_fix(readback.normalized_level) => {
+                                let mut s = status_clone.lock().unwrap();
+                                if did_unmute {
+                                    s.last_unmute = Some(Instant::now());
+                                    s.unmutes_count += 1;
+                                }
+                                if did_fix_volume {
+                                    s.last_volume_fix = Some(Instant::now());
+                                    s.fixes_count += 1;
+                                }
+                                s.error = None;
+                                s.last_action_reason = Some("write-verified".into());
+                                restore_verified = true;
+                                break;
+                            }
+                            _ => {
+                                let mut s = status_clone.lock().unwrap();
+                                s.post_write_verify_failures += 1;
+                                recovery_error = Some("Post-write verification failed");
+                            }
+                        }
+                    }
+
+                    if recovery_error.is_none() {
+                        break;
+                    }
+
+                    {
+                        let mut s = status_clone.lock().unwrap();
+                        s.last_action_reason = Some("write-failed".into());
+                        s.write_failures += 1;
+                        if write_attempts == 0 {
+                            s.write_retries += 1;
+                        }
+                    }
+
+                    if write_attempts == 0 {
+                        write_attempts += 1;
+                        match ensure_default_mic_for_write(
+                            enumerator,
+                            &current_mic_id,
+                            true,
+                            &callback_tx,
+                            callback_context,
+                            &status_clone,
+                            &mut mic,
+                        ) {
+                            Some(volume) => {
+                                effective_volume = volume;
+                                continue;
+                            }
+                            None => {
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+
+                    break;
+                }
+
+                if restore_verified {
+                    set_status_error(&status_clone, None);
+                } else {
+                    set_status_error(&status_clone, Some("Failed to enforce microphone settings".into()));
+                }
+                restore_rate_limit_ms = if restore_verified {
+                    RESTORE_RATE_LIMIT_MS
+                } else {
+                    next_retry_delay(restore_rate_limit_ms)
+                };
                 notify_delay_ms = RETRY_DELAY_MIN_MS;
 
                 // Send notification with cooldown
@@ -608,8 +966,10 @@ fn main() {
                     last_notify = Instant::now();
                 }
 
-                let sleep_delay = if external_change {
-                    Duration::from_millis(100)
+                pending_external_change = None;
+                last_periodic_check = Instant::now();
+                let sleep_delay = if external_change_handling {
+                    Duration::from_millis(120)
                 } else {
                     Duration::from_secs(1)
                 };
@@ -627,12 +987,16 @@ fn main() {
     let device_item = MenuItem::new("Mic: starting...", false, None);
     let volume_item = MenuItem::new("Volume: checking...", false, None);
     let unmute_item = MenuItem::new("Unmute: n/a", false, None);
+    let action_item = MenuItem::new("Action: idle", false, None);
+    let restore_item = MenuItem::new("Restore: none", false, None);
     let pause_item = CheckMenuItem::new("Paused", true, false, None);
     let startup_item = CheckMenuItem::new("Start with Windows", true, is_in_startup(), None);
     let quit_item = MenuItem::new("Quit", true, None);
     menu.append(&device_item).unwrap();
     menu.append(&volume_item).unwrap();
     menu.append(&unmute_item).unwrap();
+    menu.append(&action_item).unwrap();
+    menu.append(&restore_item).unwrap();
     menu.append(&PredefinedMenuItem::separator()).unwrap();
     menu.append(&pause_item).unwrap();
     menu.append(&startup_item).unwrap();
@@ -651,6 +1015,8 @@ fn main() {
     let mut last_device_text = String::new();
     let mut last_volume_text = String::new();
     let mut last_unmute_text = String::new();
+    let mut last_action_text = String::new();
+    let mut last_restore_text = String::new();
     let mut should_quit = false;
 
     'main: loop {
@@ -733,6 +1099,33 @@ fn main() {
                 if unmute_text != last_unmute_text {
                     let _ = unmute_item.set_text(unmute_text.clone());
                     last_unmute_text = unmute_text;
+                }
+
+                let action_text = if let Some(ref err) = s.error {
+                    format!("Action: {err}")
+                } else if let Some(ref reason) = s.last_action_reason {
+                    format!("Action: {reason}")
+                } else {
+                    "Action: monitoring".to_string()
+                };
+                if action_text != last_action_text {
+                    let _ = action_item.set_text(action_text.clone());
+                    last_action_text = action_text;
+                }
+
+                let restore_text = format!(
+                    "Restore attempts: {} (misses: {}, reconnects: {}, write retries: {}, write fails: {}, verify fails: {}, callback reg fails: {})",
+                    s.restore_attempts,
+                    s.restore_misses,
+                    s.reconnects,
+                    s.write_retries,
+                    s.write_failures,
+                    s.post_write_verify_failures,
+                    s.callback_registration_failures
+                );
+                if restore_text != last_restore_text {
+                    let _ = restore_item.set_text(restore_text.clone());
+                    last_restore_text = restore_text;
                 }
             }
         }

@@ -39,3 +39,6 @@ features = [
     "Win32_Security",
     "Win32_System_Registry",
 ]
+[patch.crates-io]
+tauri-winrt-notification = { path = "third_party/tauri-winrt-notification" }
+embed-resource = { path = "third_party/embed-resource" }
