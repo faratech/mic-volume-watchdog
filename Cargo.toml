@@ -4,8 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-tray-icon = { version = "0.21", default-features = false }
-tauri-winrt-notification = "0.7"
+tray-icon = { version = "0.24.1", default-features = false }
+tauri-winrt-notification = "0.7.2"
+windows-core = "0.62.2"
 
 [profile.release]
 opt-level = "z"        # optimize for size
@@ -18,7 +19,7 @@ panic = "abort"        # smaller than unwind tables
 embed-resource = "3"
 
 [dependencies.windows]
-version = "0.62"
+version = "0.62.2"
 features = [
     "Win32_Media_Audio",
     "Win32_Media_Audio_Endpoints",
@@ -30,7 +31,7 @@ features = [
 ]
 
 [dependencies.windows-sys]
-version = "0.61"
+version = "0.61.2"
 features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_System_Threading",

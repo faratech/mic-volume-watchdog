@@ -8,6 +8,8 @@ use std::time::{Duration, Instant};
 
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIconBuilder};
+use windows::core::GUID;
+use windows_core::implement;
 
 use windows::{
     Win32::Devices::FunctionDiscovery::*,
@@ -22,6 +24,27 @@ const NOTIFY_COOLDOWN_SECS: u64 = 30;
 const VOLUME_RESTORE_THRESHOLD: f32 = 1.0;
 const RETRY_DELAY_MIN_MS: u64 = 500;
 const RETRY_DELAY_MAX_MS: u64 = 5_000;
+const MIC_FIXER_CONTEXT: GUID = GUID::from_u128(0x5e4f84ce_2b8f_4a74_b7f8_1b7f9d4e1c6a);
+
+#[implement(IAudioEndpointVolumeCallback)]
+struct VolumeCallback {
+    tx: mpsc::Sender<()>,
+    allowed_context: GUID,
+}
+
+impl IAudioEndpointVolumeCallback_Impl for VolumeCallback_Impl {
+    fn OnNotify(&self, pnotify: *mut AUDIO_VOLUME_NOTIFICATION_DATA) -> windows_core::Result<()> {
+        let allow = unsafe {
+            !pnotify.is_null() && (*pnotify).guidEventContext == self.allowed_context
+        };
+
+        if !allow {
+            let _ = self.tx.send(());
+        }
+
+        Ok(())
+    }
+}
 
 fn format_duration(total_secs: u64) -> String {
     if total_secs == 0 {
@@ -329,6 +352,16 @@ fn acquire_mic(
     }
 }
 
+fn detach_mic(
+    mic: &mut Option<(String, String, IAudioEndpointVolume, Option<IAudioEndpointVolumeCallback>)>,
+) {
+    if let Some((_id, _name, volume, callback)) = mic.take() {
+        if let Some(callback) = callback {
+            let _ = unsafe { volume.UnregisterControlChangeNotify(&callback) };
+        }
+    }
+}
+
 fn main() {
     let _mutex = ensure_single_instance();
     enable_efficiency_mode();
@@ -344,6 +377,7 @@ fn main() {
     }));
 
     let (notify_tx, notify_rx) = mpsc::channel::<String>();
+    let (callback_tx, callback_rx) = mpsc::channel::<()>();
     let running = Arc::new(AtomicBool::new(true));
 
     let status_clone = status.clone();
@@ -356,14 +390,21 @@ fn main() {
             let mut enumerator: Option<IMMDeviceEnumerator> = None;
             let mut notify_delay_ms = RETRY_DELAY_MIN_MS;
             let mut enumerator_delay_ms = RETRY_DELAY_MIN_MS;
+            let callback_context = MIC_FIXER_CONTEXT;
 
-            let mut mic: Option<(String, String, IAudioEndpointVolume)> = None;
+            let mut mic: Option<(String, String, IAudioEndpointVolume, Option<IAudioEndpointVolumeCallback>)> =
+                None;
             let mut last_notify = Instant::now() - Duration::from_secs(NOTIFY_COOLDOWN_SECS);
             let mut iteration: u32 = 0;
 
             loop {
                 if !running_clone.load(Ordering::Acquire) {
                     break;
+                }
+
+                let mut external_change = false;
+                while let Ok(()) = callback_rx.try_recv() {
+                    external_change = true;
                 }
 
                 // If paused, just sleep
@@ -373,19 +414,17 @@ fn main() {
                 }
 
                 if !com_inited {
-                    match CoInitializeEx(None, COINIT_MULTITHREADED) {
-                        Ok(()) => {
-                            com_inited = true;
-                        }
-                        Err(err) => {
-                            set_status_error(
-                                &status_clone,
-                                Some(format!("COM initialization failed: {err}")),
-                            );
-                            thread::sleep(Duration::from_millis(notify_delay_ms));
-                            notify_delay_ms = next_retry_delay(notify_delay_ms);
-                            continue;
-                        }
+                    let hr = CoInitializeEx(None, COINIT_MULTITHREADED);
+                    if hr.is_ok() {
+                        com_inited = true;
+                    } else {
+                        set_status_error(
+                            &status_clone,
+                            Some(format!("COM initialization failed: {hr:?}")),
+                        );
+                        thread::sleep(Duration::from_millis(notify_delay_ms));
+                        notify_delay_ms = next_retry_delay(notify_delay_ms);
+                        continue;
                     }
                 }
 
@@ -413,10 +452,24 @@ fn main() {
                 if mic.is_none() {
                     match acquire_mic(enumerator) {
                         Some((id, name, vol)) => {
+                            let callback: Option<IAudioEndpointVolumeCallback> = {
+                                let callback = VolumeCallback {
+                                    tx: callback_tx.clone(),
+                                    allowed_context: callback_context,
+                                }
+                                .into();
+
+                                if vol.RegisterControlChangeNotify(&callback).is_ok() {
+                                    Some(callback)
+                                } else {
+                                    None
+                                }
+                            };
+
                             let mut s = status_clone.lock().unwrap();
                             s.device_name = name.clone();
                             s.error = None;
-                            mic = Some((id, name, vol));
+                            mic = Some((id, name, vol, callback));
                             notify_delay_ms = RETRY_DELAY_MIN_MS;
                             enumerator_delay_ms = RETRY_DELAY_MIN_MS;
                         }
@@ -441,7 +494,7 @@ fn main() {
                                 let mut s = status_clone.lock().unwrap();
                                 s.error = Some("Default microphone changed, reconnecting...".into());
                             }
-                            mic = None;
+                            detach_mic(&mut mic);
                             notify_delay_ms = RETRY_DELAY_MIN_MS;
                             enumerator_delay_ms = RETRY_DELAY_MIN_MS;
                             continue;
@@ -449,14 +502,14 @@ fn main() {
                     } else {
                         let mut s = status_clone.lock().unwrap();
                         s.error = Some("Failed to read default microphone ID".into());
-                        mic = None;
+                        detach_mic(&mut mic);
                         thread::sleep(Duration::from_millis(notify_delay_ms));
                         notify_delay_ms = next_retry_delay(notify_delay_ms);
                         continue;
                     }
                 }
 
-                let (_id, _name, volume) = mic.as_ref().unwrap();
+                let (_id, _name, volume, _callback) = mic.as_ref().unwrap();
 
                 let mut did_unmute = false;
                 let mut did_fix_volume = false;
@@ -466,7 +519,10 @@ fn main() {
                 // Check mute — if the call fails, the device is gone
                 match volume.GetMute() {
                     Ok(muted) if muted.as_bool() => {
-                        if volume.SetMute(false, std::ptr::null()).is_ok() {
+                        if volume
+                            .SetMute(false, &callback_context)
+                            .is_ok()
+                        {
                             let mut s = status_clone.lock().unwrap();
                             s.last_unmute = Some(Instant::now());
                             s.unmutes_count += 1;
@@ -481,7 +537,7 @@ fn main() {
                     }
                     Err(_) => {
                         // Device lost — drop and re-acquire next loop
-                        mic = None;
+                        detach_mic(&mut mic);
                         {
                             let mut s = status_clone.lock().unwrap();
                             s.error = Some("Microphone disconnected, reconnecting...".into());
@@ -499,7 +555,7 @@ fn main() {
                         old_pct = (normalized * 100.0).round() as u32;
                         if volume_needs_fix(normalized) {
                             if volume
-                                .SetMasterVolumeLevelScalar(1.0, std::ptr::null())
+                                .SetMasterVolumeLevelScalar(1.0, &callback_context)
                                 .is_ok()
                             {
                                 let mut s = status_clone.lock().unwrap();
@@ -517,7 +573,7 @@ fn main() {
                     }
                     Err(_) => {
                         // Device lost — drop and re-acquire next loop
-                        mic = None;
+                        detach_mic(&mut mic);
                         {
                             let mut s = status_clone.lock().unwrap();
                             s.error = Some("Microphone disconnected, reconnecting...".into());
@@ -552,9 +608,15 @@ fn main() {
                     last_notify = Instant::now();
                 }
 
-                thread::sleep(Duration::from_secs(1));
+                let sleep_delay = if external_change {
+                    Duration::from_millis(100)
+                } else {
+                    Duration::from_secs(1)
+                };
+                thread::sleep(sleep_delay);
             }
             if com_inited {
+                detach_mic(&mut mic);
                 CoUninitialize();
             }
         }
