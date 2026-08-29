@@ -27,7 +27,7 @@ impl ResourceCompiler {
     }
 
     pub fn compile_resource<Ms: AsRef<OsStr>, Mi: IntoIterator<Item = Ms>, Is: AsRef<OsStr>, Ii: IntoIterator<Item = Is>>(
-        &self, out_dir: &str, prefix: &str, resource: &str, parameters: ParameterBundle<Ms, Mi, Is, Ii>)
+        self, out_dir: &str, prefix: &str, resource: &str, parameters: ParameterBundle<Ms, Mi, Is, Ii>)
         -> Result<String, Cow<'static, str>> {
         let out_file = format!("{}{}{}.lib", out_dir, MAIN_SEPARATOR, prefix);
         let (_, rc) = env_target_and_rc()?;
@@ -72,6 +72,10 @@ pub fn find_windows_sdk_tool_impl(tool: &str) -> Option<PathBuf> {
 
 
 fn find_with_vswhom(arch: Arch, tool: &str) -> Option<PathBuf> {
+    if !matches!(arch, Arch::X86 | Arch::X64) {
+        return None;
+    }
+
     let res = VsFindResult::search();
     res.as_ref()
         .and_then(|res| res.windows_sdk_root.as_ref())
