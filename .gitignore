@@ -69,3 +69,4 @@ third_party/*/resources/test/
 # Nested tool build artifacts
 third_party/*/target/
 tools/*/target/
+.claude/settings.local.json
